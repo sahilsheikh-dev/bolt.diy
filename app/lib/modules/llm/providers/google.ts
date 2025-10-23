@@ -13,25 +13,19 @@ export default class GoogleProvider extends BaseProvider {
   };
 
   staticModels: ModelInfo[] = [
-    /*
-     * Essential fallback models - only the most reliable/stable ones
-     * Gemini 1.5 Pro: 2M context, 8K output limit (verified from API docs)
-     */
     {
-      name: 'gemini-1.5-pro',
-      label: 'Gemini 1.5 Pro',
+      name: 'gemini-2.5-pro',
+      label: 'Gemini 2.5 Pro',
       provider: 'Google',
-      maxTokenAllowed: 2000000,
-      maxCompletionTokens: 8192,
+      maxTokenAllowed: 1048576,
+      maxCompletionTokens: 65536,
     },
-
-    // Gemini 1.5 Flash: 1M context, 8K output limit, fast and cost-effective
     {
-      name: 'gemini-1.5-flash',
-      label: 'Gemini 1.5 Flash',
+      name: 'gemini-2.5-flash',
+      label: 'Gemini 2.5 Flash',
       provider: 'Google',
-      maxTokenAllowed: 1000000,
-      maxCompletionTokens: 8192,
+      maxTokenAllowed: 1048576,
+      maxCompletionTokens: 65536,
     },
   ];
 
@@ -52,23 +46,34 @@ export default class GoogleProvider extends BaseProvider {
       throw `Missing Api Key configuration for ${this.name} provider`;
     }
 
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {
-      headers: {
-        ['Content-Type']: 'application/json',
-      },
+    // 👇 Use v1 or fallback to v1beta dynamically from env
+    const API_VERSION = serverEnv?.GOOGLE_API_VERSION || 'v1beta';
+
+    const BASE_URL = serverEnv?.GOOGLE_BASE_URL || 'https://generativelanguage.googleapis.com';
+    const MODELS_ENDPOINT = `${BASE_URL}/${API_VERSION}/models?key=${apiKey}`;
+
+    const response = await fetch(MODELS_ENDPOINT, {
+      headers: { 'Content-Type': 'application/json' },
     });
 
     if (!response.ok) {
       throw new Error(`Failed to fetch models from Google API: ${response.status} ${response.statusText}`);
     }
 
-    const res = (await response.json()) as any;
+    const body = await response.json();
 
-    if (!res.models || !Array.isArray(res.models)) {
+    if (
+      !body ||
+      typeof body !== 'object' ||
+      !('models' in body) ||
+      !(body as any).models ||
+      !Array.isArray((body as any).models)
+    ) {
       throw new Error('Invalid response format from Google API');
     }
 
-    // Filter out models with very low token limits and experimental/unstable models
+    const res = body as { models: any[] };
+
     const data = res.models.filter((model: any) => {
       const hasGoodTokenLimit = (model.outputTokenLimit || 0) > 8000;
       const isStable = !model.name.includes('exp') || model.name.includes('flash-exp');
@@ -78,41 +83,23 @@ export default class GoogleProvider extends BaseProvider {
 
     return data.map((m: any) => {
       const modelName = m.name.replace('models/', '');
+      let contextWindow = m.inputTokenLimit || 32000;
 
-      // Get accurate context window from Google API
-      let contextWindow = 32000; // default fallback
-
-      if (m.inputTokenLimit && m.outputTokenLimit) {
-        // Use the input limit as the primary context window (typically larger)
-        contextWindow = m.inputTokenLimit;
-      } else if (modelName.includes('gemini-1.5-pro')) {
-        contextWindow = 2000000; // Gemini 1.5 Pro has 2M context
-      } else if (modelName.includes('gemini-1.5-flash')) {
-        contextWindow = 1000000; // Gemini 1.5 Flash has 1M context
-      } else if (modelName.includes('gemini-2.0-flash')) {
-        contextWindow = 1000000; // Gemini 2.0 Flash has 1M context
-      } else if (modelName.includes('gemini-pro')) {
-        contextWindow = 32000; // Gemini Pro has 32k context
-      } else if (modelName.includes('gemini-flash')) {
-        contextWindow = 32000; // Gemini Flash has 32k context
+      if (modelName.includes('gemini-1.5-pro')) {
+        contextWindow = 2000000;
       }
 
-      // Cap at reasonable limits to prevent issues
-      const maxAllowed = 2000000; // 2M tokens max
-      const finalContext = Math.min(contextWindow, maxAllowed);
-
-      // Get completion token limit from Google API
-      let completionTokens = 8192; // default fallback (Gemini 1.5 standard limit)
-
-      if (m.outputTokenLimit && m.outputTokenLimit > 0) {
-        completionTokens = Math.min(m.outputTokenLimit, 128000); // Use API value, cap at reasonable limit
+      if (modelName.includes('gemini-1.5-flash')) {
+        contextWindow = 1000000;
       }
+
+      const completionTokens = Math.min(m.outputTokenLimit || 8192, 128000);
 
       return {
         name: modelName,
-        label: `${m.displayName} (${finalContext >= 1000000 ? Math.floor(finalContext / 1000000) + 'M' : Math.floor(finalContext / 1000) + 'k'} context)`,
+        label: `${m.displayName} (${contextWindow >= 1000000 ? Math.floor(contextWindow / 1000000) + 'M' : Math.floor(contextWindow / 1000) + 'k'} context)`,
         provider: this.name,
-        maxTokenAllowed: finalContext,
+        maxTokenAllowed: contextWindow,
         maxCompletionTokens: completionTokens,
       };
     });
@@ -138,10 +125,36 @@ export default class GoogleProvider extends BaseProvider {
       throw new Error(`Missing API key for ${this.name} provider`);
     }
 
-    const google = createGoogleGenerativeAI({
-      apiKey,
-    });
+    const API_VERSION = serverEnv?.GOOGLE_API_VERSION || 'v1beta';
 
-    return google(model);
+    const BASE_URL = serverEnv?.GOOGLE_BASE_URL || 'https://generativelanguage.googleapis.com';
+    const ENDPOINT = `${BASE_URL}/${API_VERSION}`;
+
+    const google = createGoogleGenerativeAI({ apiKey, baseUrl: ENDPOINT });
+    const modelInstance: any = google(model);
+
+    // Patch the internal fetch before any request happens
+    const originalFetch = modelInstance.config.fetch ?? globalThis.fetch;
+
+    modelInstance.config.fetch = async (url: string, opts: RequestInit) => {
+      try {
+        if (opts?.body && typeof opts.body === 'string' && opts.body.includes('"systemInstruction"')) {
+          const parsed = JSON.parse(opts.body);
+
+          if (parsed.systemInstruction) {
+            // ✅ Gemini 2.x expects `system_instruction`, not `system`
+            parsed.system_instruction = parsed.systemInstruction;
+            delete parsed.systemInstruction;
+            opts.body = JSON.stringify(parsed);
+          }
+        }
+      } catch (e) {
+        console.warn('Google fetch patch error:', e);
+      }
+
+      return originalFetch(url, opts);
+    };
+
+    return modelInstance;
   }
 }
