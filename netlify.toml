@@ -1,3 +1,9 @@
 [build]
   command = "NODE_OPTIONS='--max-old-space-size=4096' pnpm run build"
   publish = "build/client"
+
+# Fix for SPA routing (Remix / React / Vite apps)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
